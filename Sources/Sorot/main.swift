@@ -51,6 +51,9 @@ func writePNG(_ rep: NSBitmapImageRep, to url: URL) {
 func writeStateSnapshots(to folder: URL) {
     let states: [(String, LightEngine.Preview)] = [
         ("auto-live", .init()),
+        ("auto-probed", .init(roomKelvin: 2900, kelvin: 2900, probe: .init(
+            date: Date().addingTimeInterval(-130), result: ProbeResult(kelvin: 2900, screenGain: 0.38)))),
+        ("auto-probe-failed", .init(probe: .init(date: Date(), result: ProbeResult(failure: .tooBright)))),
         ("auto-no-face", .init(faceFound: false, faceLuma: nil, level: 0.4)),
         ("manual", .init(isAutomatic: false, camera: .idle, faceFound: false, faceLuma: nil, roomKelvin: nil, level: 0.6, kelvin: 4500)),
         ("denied", .init(camera: .denied, faceFound: false, faceLuma: nil, roomKelvin: nil, level: 0)),
@@ -121,7 +124,9 @@ func value(after flag: String) -> String? {
     return arguments[index + 1]
 }
 
-if let path = value(after: "--snapshot") ?? value(after: "--fonts") {
+if arguments.contains("--selftest") {
+    exit(ProbeMath.selfTest() ? 0 : 1)
+} else if let path = value(after: "--snapshot") ?? value(after: "--fonts") {
     _ = NSApplication.shared
     let folder = URL(fileURLWithPath: path)
     try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

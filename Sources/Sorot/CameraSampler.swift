@@ -14,6 +14,54 @@ struct Reading: Sendable {
     var frameLuma: Double
     /// Colour temperature of the background, or nil when too little of it is usable.
     var roomKelvin: Double?
+
+    // Colour data for the probe and for training. All values are linear light.
+    /// Mean colour of the middle of the face.
+    var faceLinear = RGB.zero
+    /// Mean colour of the background, or nil when too little of it is usable.
+    var roomLinear: RGB?
+    /// Share of face pixels at the sensor's ceiling, where colour is lost.
+    var faceClipped = 0.0
+    /// Where the background's and the face's colours fall, as histograms over
+    /// log(G/R) and log(G/B). They hold no positions, so no picture can be rebuilt.
+    var roomHistogram: [Float] = []
+    var faceHistogram: [Float] = []
+}
+
+/// A colour in linear light.
+struct RGB: Sendable {
+    var r: Double, g: Double, b: Double
+    static let zero = RGB(r: 0, g: 0, b: 0)
+    var luma: Double { 0.2126 * r + 0.7152 * g + 0.0722 * b }
+    var list: [Double] { [r, g, b] }
+
+    static func mean(_ colors: [RGB]) -> RGB {
+        let n = Double(max(colors.count, 1))
+        return RGB(r: colors.reduce(0) { $0 + $1.r } / n,
+                   g: colors.reduce(0) { $0 + $1.g } / n,
+                   b: colors.reduce(0) { $0 + $1.b } / n)
+    }
+}
+
+/// A 2-D histogram of colour, independent of brightness.
+struct ChromaHistogram {
+    static let bins = 12
+    static let range = 1.2
+    private var counts = [Float](repeating: 0, count: bins * bins)
+    private var total: Float = 0
+
+    mutating func add(r: Double, g: Double, b: Double) {
+        let u = log((g + 1e-4) / (r + 1e-4)), v = log((g + 1e-4) / (b + 1e-4))
+        counts[Self.bin(v) * Self.bins + Self.bin(u)] += 1
+        total += 1
+    }
+
+    private static func bin(_ x: Double) -> Int {
+        min(bins - 1, max(0, Int((x + range) / (2 * range) * Double(bins))))
+    }
+
+    /// Counts scaled to sum to 1, or all zeros when empty.
+    var normalized: [Float] { total > 0 ? counts.map { $0 / total } : counts }
 }
 
 /// Reads the webcam a few times per second and turns each frame into a `Reading`.
@@ -31,7 +79,12 @@ final class CameraSampler: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private let queue = DispatchQueue(label: "sorot.camera")
     private var isConfigured = false
     private var lastSampleTime = 0.0
-    private let sampleInterval = 0.2
+    private var sampleInterval = 0.2
+
+    /// How often a frame is measured. The probe asks for a faster rate while it runs.
+    func setSampleInterval(_ seconds: Double) {
+        queue.async { [self] in sampleInterval = seconds }
+    }
 
     private let faceRequest = VNDetectFaceRectanglesRequest()
     private let personRequest: VNGeneratePersonSegmentationRequest = {
@@ -141,6 +194,8 @@ final class CameraSampler: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         var leftSum = 0.0, rightSum = 0.0, leftCount = 0, rightCount = 0
         var frameSum = 0.0, frameCount = 0
         var roomR = 0.0, roomG = 0.0, roomB = 0.0, roomCount = 0
+        var faceR = 0.0, faceG = 0.0, faceB = 0.0, faceClippedCount = 0
+        var roomHistogram = ChromaHistogram(), faceHistogram = ChromaHistogram()
         let lut = ColorScience.linearLUT
         let stride = 6
 
@@ -157,9 +212,13 @@ final class CameraSampler: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 frameCount += 1
 
                 let point = CGPoint(x: u, y: v)
+                let peak = max(r, g, b)
                 if let faceCore, faceCore.contains(point) {
                     if u < faceCore.midX { leftSum += luma; leftCount += 1 }
                     else { rightSum += luma; rightCount += 1 }
+                    faceR += lut[r]; faceG += lut[g]; faceB += lut[b]
+                    if peak >= 250 { faceClippedCount += 1 }
+                    else if peak > 20 { faceHistogram.add(r: lut[r], g: lut[g], b: lut[b]) }
                 } else {
                     let isPerson: Bool
                     if let maskPixels {
@@ -172,10 +231,10 @@ final class CameraSampler: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                         isPerson = false
                     }
                     // Clipped and near-black pixels carry no colour information.
-                    let peak = max(r, g, b)
                     if !isPerson, peak < 245, peak > 20 {
                         roomR += lut[r]; roomG += lut[g]; roomB += lut[b]
                         roomCount += 1
+                        roomHistogram.add(r: lut[r], g: lut[g], b: lut[b])
                     }
                 }
                 x += stride
@@ -186,9 +245,11 @@ final class CameraSampler: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         guard frameCount > 0 else { return nil }
         let faceCount = leftCount + rightCount
         let faceFound = faceCount >= 12 && leftCount > 0 && rightCount > 0
-        let roomKelvin = roomCount >= 200
-            ? ColorScience.kelvin(linearR: roomR / Double(roomCount), g: roomG / Double(roomCount), b: roomB / Double(roomCount))
+        let roomLinear = roomCount >= 200
+            ? RGB(r: roomR / Double(roomCount), g: roomG / Double(roomCount), b: roomB / Double(roomCount))
             : nil
+        let roomKelvin = roomLinear.flatMap { ColorScience.kelvin(linearR: $0.r, g: $0.g, b: $0.b) }
+        let n = Double(max(faceCount, 1))
 
         return Reading(
             faceFound: faceFound,
@@ -196,7 +257,12 @@ final class CameraSampler: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             imageLeftLuma: faceFound ? leftSum / Double(leftCount) : 0,
             imageRightLuma: faceFound ? rightSum / Double(rightCount) : 0,
             frameLuma: frameSum / Double(frameCount),
-            roomKelvin: roomKelvin
+            roomKelvin: roomKelvin,
+            faceLinear: faceFound ? RGB(r: faceR / n, g: faceG / n, b: faceB / n) : .zero,
+            roomLinear: roomLinear,
+            faceClipped: faceFound ? Double(faceClippedCount) / n : 0,
+            roomHistogram: roomHistogram.normalized,
+            faceHistogram: faceHistogram.normalized
         )
     }
 }

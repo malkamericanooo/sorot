@@ -55,12 +55,19 @@ struct PanelView: View {
             ) {
                 LevelBar(value: engine.faceLuma, tick: showsTarget ? engine.target : nil, fill: .primary.opacity(0.7))
             }
-            ReadingRow(
-                label: "Room",
-                value: engine.roomKelvin.map { kelvinText($0) } ?? "–",
-                spoken: engine.roomKelvin.map { kelvinText($0) } ?? "no reading"
-            ) {
-                KelvinStrip(value: engine.roomKelvin, scale: Self.kelvinScale)
+            VStack(alignment: .leading, spacing: 9) {
+                ReadingRow(
+                    label: "Room",
+                    value: engine.roomKelvin.map { kelvinText($0) } ?? "–",
+                    spoken: (engine.roomKelvin.map { kelvinText($0) } ?? "no reading") + ". " + engine.roomSource
+                ) {
+                    KelvinStrip(value: engine.roomKelvin, scale: Self.kelvinScale)
+                }
+                Text(engine.roomSource)
+                    .font(fonts.text(11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityHidden(true)
             }
             ReadingRow(
                 label: "Glow",
@@ -112,6 +119,25 @@ struct PanelView: View {
                           text: kelvinText(engine.manualKelvin))
             }
             SliderRow(label: "Reach", value: $engine.reach, range: 0...1, text: percent(engine.reach))
+
+            if engine.isAutomatic {
+                Divider()
+                HStack {
+                    Text("Probe every 5 minutes")
+                    Spacer()
+                    Toggle("Probe every 5 minutes", isOn: $engine.probesAutomatically)
+                        .toggleStyle(.switch)
+                        .labelsHidden()
+                }
+                Button { engine.startProbe() } label: {
+                    Text("Probe Room Light Now").font(fonts.text(13))
+                }
+                .disabled(!engine.canProbe)
+                Text("The screen edges go black, then white, for about a second.")
+                    .font(fonts.text(11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(16)
         .disabled(!engine.isOn)
@@ -119,10 +145,10 @@ struct PanelView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Toggle(isOn: $engine.logsReadings) {
+            Toggle(isOn: $engine.savesProbes) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Log readings")
-                    Text("Numbers only, for training a model later.")
+                    Text("Save probe data")
+                    Text("Numbers and colour counts for training. Never images.")
                         .font(fonts.text(11))
                         .foregroundStyle(.secondary)
                 }
@@ -130,11 +156,11 @@ struct PanelView: View {
             .toggleStyle(.checkbox)
 
             HStack {
-                if engine.logsReadings {
+                if engine.savesProbes {
                     Button {
-                        NSWorkspace.shared.activateFileViewerSelecting([ReadingLog.fileURL])
+                        NSWorkspace.shared.activateFileViewerSelecting([ProbeLog.fileURL])
                     } label: {
-                        Text("Show Log File").font(fonts.text(13))
+                        Text("Show File").font(fonts.text(13))
                     }
                 }
                 Spacer()

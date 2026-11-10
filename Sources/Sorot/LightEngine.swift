@@ -3,10 +3,16 @@ import Combine
 import Foundation
 import QuartzCore
 
-/// Owns the settings, the camera, the control loop and the glow.
+/// Owns the settings, the camera, the control loop, the probe and the glow.
 /// Everything here runs on the main thread.
 final class LightEngine: ObservableObject {
     enum CameraState { case idle, starting, live, denied, missing }
+
+    /// A finished probe and when it ran.
+    struct ProbeOutcome {
+        var date: Date
+        var result: ProbeResult
+    }
 
     /// What the panel needs to draw a state without a camera, for snapshots.
     struct Preview {
@@ -18,6 +24,7 @@ final class LightEngine: ObservableObject {
         var roomKelvin: Double? = 3400
         var level = 0.62
         var kelvin = 3400.0
+        var probe: ProbeOutcome?
     }
 
     // Settings, saved between launches.
@@ -27,29 +34,54 @@ final class LightEngine: ObservableObject {
     @Published var manualLevel: Double { didSet { save(manualLevel, "manualLevel"); refresh() } }
     @Published var manualKelvin: Double { didSet { save(manualKelvin, "manualKelvin"); refresh() } }
     @Published var reach: Double { didSet { save(reach, "reach"); pushGlow() } }
-    @Published var logsReadings: Bool { didSet { save(logsReadings, "logsReadings") } }
+    @Published var probesAutomatically: Bool { didSet { save(probesAutomatically, "probesAutomatically") } }
+    @Published var savesProbes: Bool { didSet { save(savesProbes, "savesProbes") } }
 
     // Live state.
     @Published private(set) var camera: CameraState = .idle
     @Published private(set) var faceFound = false
     @Published private(set) var faceLuma: Double?
+    /// The room's colour temperature: the picture-based estimate, corrected by the last probe.
     @Published private(set) var roomKelvin: Double?
     @Published private(set) var level = 0.0
     @Published private(set) var kelvin = 5000.0
+    @Published private(set) var isProbing = false
+    @Published private(set) var lastProbe: ProbeOutcome?
 
     /// Half-width of the band around the target in which the glow is left alone.
     static let deadband = 0.03
     static let targetRange = 0.30...0.65
     static let kelvinRange = 2700.0...6500.0
+    static let automaticProbeInterval = 300.0
 
     private let isPreview: Bool
     private let defaults = UserDefaults.standard
     private let sampler = CameraSampler()
     private var glow: GlowController?
-    private let log = ReadingLog()
+    private let probeLog = ProbeLog()
     private var lastReadingTime = 0.0
+    private var lastReading: Reading?
     private var leftGain = 1.0
     private var rightGain = 1.0
+
+    /// The estimate read from the picture alone, before the probe's correction.
+    private var pictureKelvin: Double?
+    /// Probe minus picture estimate, in mireds (1e6 / kelvin), where such shifts add up.
+    private var miredCorrection = 0.0
+
+    // Probe timing: wait for the screen and camera to settle, then average a few frames.
+    private static let probeSettle = 0.35
+    private static let probeSamples = 5
+    private static let probeTimeout = 4.0
+    private enum ProbeStage {
+        case idle
+        case dark(since: Double, samples: [Reading])
+        case lit(since: Double, dark: ProbePhase, samples: [Reading])
+    }
+    private var probeStage = ProbeStage.idle
+    private var probeStart = 0.0
+    private var lastProbeAttempt = 0.0
+    private var probeContext: (reading: Reading, pictureKelvin: Double?, level: Double, kelvin: Double)?
 
     init(preview: Preview? = nil) {
         isPreview = preview != nil
@@ -60,7 +92,8 @@ final class LightEngine: ObservableObject {
         manualLevel = d.object(forKey: "manualLevel") as? Double ?? 0.6
         manualKelvin = d.object(forKey: "manualKelvin") as? Double ?? 4500
         reach = d.object(forKey: "reach") as? Double ?? 0.5
-        logsReadings = preview == nil && d.bool(forKey: "logsReadings")
+        probesAutomatically = preview == nil && d.bool(forKey: "probesAutomatically")
+        savesProbes = preview == nil && d.bool(forKey: "savesProbes")
 
         if let preview {
             camera = preview.camera
@@ -69,6 +102,7 @@ final class LightEngine: ObservableObject {
             roomKelvin = preview.roomKelvin
             level = preview.level
             kelvin = preview.kelvin
+            lastProbe = preview.probe
             return
         }
 
@@ -86,6 +120,7 @@ final class LightEngine: ObservableObject {
     var status: String {
         guard isOn else { return "Off" }
         guard isAutomatic else { return "Manual light" }
+        if isProbing { return "Probing room light…" }
         switch camera {
         case .idle, .starting: return "Starting camera…"
         case .denied: return "Camera access is off"
@@ -99,16 +134,33 @@ final class LightEngine: ObservableObject {
         }
     }
 
+    /// Says where the Room reading comes from.
+    var roomSource: String {
+        guard isOn, isAutomatic else { return "Camera is off in this mode." }
+        if isProbing { return "Measuring…" }
+        guard let lastProbe else { return "Estimated from the picture. Probe to measure it." }
+        if let failure = lastProbe.result.failure { return failure.message }
+        let minutes = Int(Date().timeIntervalSince(lastProbe.date) / 60)
+        let when = minutes < 1 ? "just now" : "\(minutes) min ago"
+        let gain = Int((lastProbe.result.screenGain * 100).rounded())
+        return "Measured by probe \(when). Full glow adds \(gain)% light."
+    }
+
+    var canProbe: Bool { isOn && isAutomatic && camera == .live && faceFound && !isProbing }
+
     // MARK: - Mode changes
 
     private func refresh() {
         guard !isPreview else { return }
+        if !isOn || !isAutomatic { cancelProbe() }
         if !isOn {
             sampler.stop()
             camera = .idle
             faceFound = false
             faceLuma = nil
             level = 0
+            lastProbe = nil
+            miredCorrection = 0
         } else if isAutomatic {
             startCameraIfAllowed()
         } else {
@@ -147,15 +199,21 @@ final class LightEngine: ObservableObject {
     private func ingest(_ reading: Reading) {
         guard isOn, isAutomatic else { return }
         camera = .live
-
         let now = CACurrentMediaTime()
+
+        if isProbing {
+            advanceProbe(with: reading, now: now)
+            return
+        }
+
         let dt = lastReadingTime == 0 ? 0.2 : min(now - lastReadingTime, 1)
         lastReadingTime = now
+        lastReading = reading
 
         if let measured = reading.roomKelvin {
-            let previous = roomKelvin ?? measured
-            roomKelvin = previous + (measured - previous) * 0.08
-            kelvin = min(max(roomKelvin ?? 5000, Self.kelvinRange.lowerBound), Self.kelvinRange.upperBound)
+            let previous = pictureKelvin ?? measured
+            pictureKelvin = previous + (measured - previous) * 0.08
+            applyRoomKelvin()
         }
 
         faceFound = reading.faceFound
@@ -182,53 +240,147 @@ final class LightEngine: ObservableObject {
             leftGain += (wantLeft - leftGain) * 0.15
         }
 
-        if logsReadings {
-            log.append(reading, level: level, kelvin: kelvin, target: target)
+        pushGlow()
+
+        if probesAutomatically, reading.faceFound, now - lastProbeAttempt >= Self.automaticProbeInterval {
+            startProbe()
+        }
+    }
+
+    /// Publishes the room reading (picture estimate plus probe correction) and aims the glow at it.
+    private func applyRoomKelvin() {
+        guard let pictureKelvin else { return }
+        let mired = 1e6 / pictureKelvin + miredCorrection
+        let corrected = mired > 0 ? min(max(1e6 / mired, 1500), 12000) : 12000
+        roomKelvin = corrected
+        kelvin = min(max(corrected, Self.kelvinRange.lowerBound), Self.kelvinRange.upperBound)
+    }
+
+    private func pushGlow() {
+        guard !isProbing else { return }
+        glow?.update(level: isOn ? level : 0, kelvin: kelvin, leftGain: leftGain, rightGain: rightGain, reach: reach)
+    }
+
+    // MARK: - Probe
+
+    /// Flashes the screen edges black, then white, to measure the room's true light colour.
+    func startProbe() {
+        guard canProbe, let reading = lastReading else { return }
+        let now = CACurrentMediaTime()
+        probeContext = (reading, pictureKelvin, level, kelvin)
+        probeStart = now
+        lastProbeAttempt = now
+        isProbing = true
+        sampler.setSampleInterval(0.07)
+        glow?.showProbe(lit: false, reach: reach)
+        probeStage = .dark(since: now, samples: [])
+    }
+
+    private func advanceProbe(with reading: Reading, now: Double) {
+        if now - probeStart > Self.probeTimeout {
+            finishProbe(ProbeResult(failure: .faceLost))
+            return
+        }
+        switch probeStage {
+        case .idle:
+            break
+        case .dark(let since, var samples):
+            guard now - since >= Self.probeSettle, reading.faceFound else { return }
+            samples.append(reading)
+            if samples.count >= Self.probeSamples {
+                glow?.showProbe(lit: true, reach: reach)
+                probeStage = .lit(since: now, dark: Self.phase(samples), samples: [])
+            } else {
+                probeStage = .dark(since: since, samples: samples)
+            }
+        case .lit(let since, let dark, var samples):
+            guard now - since >= Self.probeSettle, reading.faceFound else { return }
+            samples.append(reading)
+            if samples.count >= Self.probeSamples {
+                finishProbe(ProbeMath.solve(dark: dark, lit: Self.phase(samples)), dark: dark, lit: Self.phase(samples))
+            } else {
+                probeStage = .lit(since: since, dark: dark, samples: samples)
+            }
+        }
+    }
+
+    private static func phase(_ samples: [Reading]) -> ProbePhase {
+        let rooms = samples.compactMap(\.roomLinear)
+        return ProbePhase(
+            face: RGB.mean(samples.map(\.faceLinear)),
+            // Only trust the background when every frame of the phase had one.
+            room: rooms.count == samples.count ? RGB.mean(rooms) : nil,
+            faceClipped: samples.map(\.faceClipped).reduce(0, +) / Double(max(samples.count, 1))
+        )
+    }
+
+    private func finishProbe(_ result: ProbeResult, dark: ProbePhase? = nil, lit: ProbePhase? = nil) {
+        let context = probeContext
+        endProbe()
+        lastProbe = ProbeOutcome(date: Date(), result: result)
+
+        if let measured = result.kelvin, let picture = context?.pictureKelvin {
+            miredCorrection = 1e6 / measured - 1e6 / picture
+            applyRoomKelvin()
+        }
+        if savesProbes, let context {
+            probeLog.append(Self.record(result, context: context, dark: dark, lit: lit))
         }
         pushGlow()
     }
 
-    private func pushGlow() {
-        glow?.update(level: isOn ? level : 0, kelvin: kelvin, leftGain: leftGain, rightGain: rightGain, reach: reach)
+    private func cancelProbe() {
+        guard isProbing else { return }
+        endProbe()
+    }
+
+    private func endProbe() {
+        probeStage = .idle
+        probeContext = nil
+        isProbing = false
+        lastReadingTime = 0
+        sampler.setSampleInterval(0.2)
+    }
+
+    /// One training example: what the camera saw in normal use, and what the probe then measured.
+    private static func record(_ result: ProbeResult,
+                               context: (reading: Reading, pictureKelvin: Double?, level: Double, kelvin: Double),
+                               dark: ProbePhase?, lit: ProbePhase?) -> [String: Any] {
+        var record: [String: Any] = [
+            "version": 1,
+            "time": Date().timeIntervalSince1970,
+            "valid": result.kelvin != nil,
+            "failure": result.failure?.rawValue ?? "",
+            "screen_gain": result.screenGain,
+            "camera_gain": result.cameraGain.list,
+            "ambient": result.ambient.list,
+            "glow_level": context.level,
+            "glow_kelvin": context.kelvin,
+            "face_luma": context.reading.faceLuma,
+            "frame_luma": context.reading.frameLuma,
+            "face_linear": context.reading.faceLinear.list,
+            "room_histogram": context.reading.roomHistogram,
+            "face_histogram": context.reading.faceHistogram,
+            "histogram_bins": ChromaHistogram.bins,
+            "histogram_range": ChromaHistogram.range,
+        ]
+        if let kelvin = result.kelvin { record["probe_kelvin"] = kelvin }
+        if let picture = context.pictureKelvin { record["picture_kelvin"] = picture }
+        if let room = context.reading.roomLinear { record["room_linear"] = room.list }
+        if let dark {
+            record["dark_face"] = dark.face.list
+            if let room = dark.room { record["dark_room"] = room.list }
+        }
+        if let lit {
+            record["lit_face"] = lit.face.list
+            record["lit_clipped"] = lit.faceClipped
+            if let room = lit.room { record["lit_room"] = room.list }
+        }
+        return record
     }
 
     private func save(_ value: Any, _ key: String) {
         guard !isPreview else { return }
         defaults.set(value, forKey: key)
-    }
-}
-
-/// Appends readings to a CSV file so a model can be trained on them later.
-/// Numbers only: no image ever leaves the camera pipeline.
-final class ReadingLog {
-    static var fileURL: URL {
-        let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Sorot", isDirectory: true)
-        return folder.appendingPathComponent("readings.csv")
-    }
-
-    private var handle: FileHandle?
-
-    func append(_ r: Reading, level: Double, kelvin: Double, target: Double) {
-        if handle == nil { open() }
-        let room = r.roomKelvin.map { String(format: "%.0f", $0) } ?? ""
-        let line = String(
-            format: "%.2f,%d,%.4f,%.4f,%.4f,%.4f,%@,%.4f,%.0f,%.2f\n",
-            Date().timeIntervalSince1970, r.faceFound ? 1 : 0, r.faceLuma, r.imageLeftLuma,
-            r.imageRightLuma, r.frameLuma, room, level, kelvin, target
-        )
-        handle?.write(Data(line.utf8))
-    }
-
-    private func open() {
-        let url = Self.fileURL
-        let manager = FileManager.default
-        try? manager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        if !manager.fileExists(atPath: url.path) {
-            let header = "time,face_found,face_luma,image_left_luma,image_right_luma,frame_luma,room_kelvin,glow_level,glow_kelvin,target\n"
-            manager.createFile(atPath: url.path, contents: Data(header.utf8))
-        }
-        handle = try? FileHandle(forWritingTo: url)
-        _ = try? handle?.seekToEnd()
     }
 }
