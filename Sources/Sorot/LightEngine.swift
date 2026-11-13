@@ -25,6 +25,9 @@ final class LightEngine: ObservableObject {
         var level = 0.62
         var kelvin = 3400.0
         var probe: ProbeOutcome?
+        var learnedProbes = 0
+        var learnerError: Double?
+        var isResting = false
     }
 
     // Settings, saved between launches.
@@ -41,15 +44,30 @@ final class LightEngine: ObservableObject {
     @Published private(set) var camera: CameraState = .idle
     @Published private(set) var faceFound = false
     @Published private(set) var faceLuma: Double?
-    /// The room's colour temperature: the picture-based estimate, corrected by the last probe.
+    /// The room's colour temperature: the picture-based estimate, corrected by the
+    /// learned model when it is trusted, and by the last probe otherwise.
     @Published private(set) var roomKelvin: Double?
     @Published private(set) var level = 0.0
     @Published private(set) var kelvin = 5000.0
     @Published private(set) var isProbing = false
     @Published private(set) var lastProbe: ProbeOutcome?
+    /// True after a probe showed that the screen's light makes no difference to the face.
+    /// The glow stays off then, because it would only cover the screen.
+    @Published private(set) var isResting = false
+    /// How many probes the learner has, and whether its model is in use.
+    @Published private(set) var learnedProbes = 0
+    @Published private(set) var learnerTrusted = false
+    /// The model's typical error on probes left out of its fit, in mireds.
+    @Published private(set) var learnerError = 0.0
 
     /// Half-width of the band around the target in which the glow is left alone.
     static let deadband = 0.03
+    /// How much brighter than the face the whole frame must be to call the scene backlit.
+    static let backlitMargin = 0.12
+    /// At full glow and still short of the target for this long, Sorot probes once to see if the glow helps at all.
+    static let stuckBeforeCheck = 8.0
+    /// The room must get this much darker, as a share of its brightness, for a resting glow to try again.
+    static let restWakeRatio = 0.7
     static let targetRange = 0.30...0.65
     static let kelvinRange = 2700.0...6500.0
     static let automaticProbeInterval = 300.0
@@ -68,6 +86,15 @@ final class LightEngine: ObservableObject {
     private var pictureKelvin: Double?
     /// Probe minus picture estimate, in mireds (1e6 / kelvin), where such shifts add up.
     private var miredCorrection = 0.0
+
+    private var learner = RoomLearner()
+    /// How far the last probe was from the model's prediction, in mireds, and when.
+    /// It pulls the model toward the newest measurement and wears off over ten minutes.
+    private var restFrameLuma = 0.0
+    private var stuckSince: Double?
+    private var probeOffset = 0.0
+    private var probeOffsetTime = 0.0
+    private static let probeOffsetLife = 600.0
 
     // Probe timing: wait for the screen and camera to settle, then average a few frames.
     private static let probeSettle = 0.35
@@ -103,10 +130,16 @@ final class LightEngine: ObservableObject {
             level = preview.level
             kelvin = preview.kelvin
             lastProbe = preview.probe
+            learnedProbes = preview.learnedProbes
+            isResting = preview.isResting
+            learnerTrusted = preview.learnerError != nil
+            learnerError = preview.learnerError ?? 0
             return
         }
 
         glow = GlowController()
+        learner = RoomLearner.load()
+        publishLearner()
         sampler.onReading = { [weak self] reading in
             DispatchQueue.main.async { self?.ingest(reading) }
         }
@@ -126,10 +159,19 @@ final class LightEngine: ObservableObject {
         case .denied: return "Camera access is off"
         case .missing: return "No camera found"
         case .live:
+            if isResting { return "Resting. The screen's light makes no difference in this room." }
             guard faceFound, let faceLuma else { return "No face in view. Holding this level." }
             let error = target - faceLuma
             if abs(error) <= Self.deadband { return "Face is on target" }
-            if error > 0 { return level >= 0.999 ? "At full glow. The room is too dark for the screen alone." : "Brightening" }
+            if error > 0 {
+                guard level >= 0.999 else { return "Brightening" }
+                // A frame much brighter than the face means the light is behind the person,
+                // and the camera is exposing for it. More screen light will not fix that.
+                if let frame = lastReading?.frameLuma, frame - faceLuma > Self.backlitMargin {
+                    return "At full glow. The light behind you is stronger than the screen. Face it, or cover it."
+                }
+                return "At full glow. The room is too dark for the screen alone."
+            }
             return level <= 0.001 ? "Room light is enough" : "Dimming"
         }
     }
@@ -138,12 +180,27 @@ final class LightEngine: ObservableObject {
     var roomSource: String {
         guard isOn, isAutomatic else { return "Camera is off in this mode." }
         if isProbing { return "Measuring…" }
-        guard let lastProbe else { return "Estimated from the picture. Probe to measure it." }
-        if let failure = lastProbe.result.failure { return failure.message }
+        if let failure = lastProbe?.result.failure { return failure.message }
+        if learnerTrusted {
+            // A mired error means more kelvin in cool light than in warm light.
+            let room = roomKelvin ?? 4000
+            let kelvinError = max(50, (learnerError * room * room / 1e6 / 50).rounded() * 50)
+            return "Learned from \(learnedProbes) probes. Usually within \(Int(kelvinError)) K."
+        }
+        guard let lastProbe else {
+            return learnedProbes > 0
+                ? "Estimated from the picture. \(learningProgress)"
+                : "Estimated from the picture. Probe to measure it."
+        }
         let minutes = Int(Date().timeIntervalSince(lastProbe.date) / 60)
         let when = minutes < 1 ? "just now" : "\(minutes) min ago"
-        let gain = Int((lastProbe.result.screenGain * 100).rounded())
-        return "Measured by probe \(when). Full glow adds \(gain)% light."
+        return "Measured by probe \(when). \(learningProgress)"
+    }
+
+    private var learningProgress: String {
+        learnedProbes < RoomLearner.minimumExamples
+            ? "Learning: \(learnedProbes) of \(RoomLearner.minimumExamples) probes."
+            : "\(learnedProbes) probes learned, not yet better than the last probe."
     }
 
     var canProbe: Bool { isOn && isAutomatic && camera == .live && faceFound && !isProbing }
@@ -152,7 +209,11 @@ final class LightEngine: ObservableObject {
 
     private func refresh() {
         guard !isPreview else { return }
-        if !isOn || !isAutomatic { cancelProbe() }
+        if !isOn || !isAutomatic {
+            cancelProbe()
+            isResting = false
+            stuckSince = nil
+        }
         if !isOn {
             sampler.stop()
             camera = .idle
@@ -212,7 +273,16 @@ final class LightEngine: ObservableObject {
 
         if let measured = reading.roomKelvin {
             let previous = pictureKelvin ?? measured
-            pictureKelvin = previous + (measured - previous) * 0.08
+            let picture = previous + (measured - previous) * 0.08
+            pictureKelvin = picture
+
+            // Between probes the learned model keeps correcting the picture estimate.
+            if let features = RoomLearner.features(reading: reading, pictureKelvin: picture, level: level),
+               let predicted = learner.predict(features) {
+                let age = now - probeOffsetTime
+                let wanted = predicted + probeOffset * exp(-age / Self.probeOffsetLife)
+                miredCorrection += (wanted - miredCorrection) * 0.1
+            }
             applyRoomKelvin()
         }
 
@@ -225,8 +295,17 @@ final class LightEngine: ObservableObject {
             // Integral control: keep nudging the glow until the face sits in the deadband.
             // While a band is out of the pointer's way the face is darker on purpose, so hold still.
             let error = target - smoothed
-            if abs(error) > Self.deadband, glow?.isYielding != true {
+            if isResting {
+                level = max(level - 2 * dt, 0)
+                // A clearly darker room is a new situation, where the screen may matter again.
+                if reading.frameLuma < restFrameLuma * Self.restWakeRatio { isResting = false }
+            } else if abs(error) > Self.deadband, glow?.isYielding != true {
                 level = min(max(level + 1.5 * error * dt, 0), 1)
+            }
+            if !isResting, level >= 0.999, error > Self.deadband {
+                if stuckSince == nil { stuckSince = now }
+            } else {
+                stuckSince = nil
             }
 
             // Dim the screen edge on the side of the face that is already brighter.
@@ -243,7 +322,9 @@ final class LightEngine: ObservableObject {
 
         pushGlow()
 
-        if probesAutomatically, reading.faceFound, now - lastProbeAttempt >= Self.automaticProbeInterval {
+        // Probe on the timer if asked to, and once when full glow is not getting the face to the target.
+        let isStuck = stuckSince.map { now - $0 >= Self.stuckBeforeCheck } ?? false
+        if probesAutomatically || isStuck, reading.faceFound, now - lastProbeAttempt >= Self.automaticProbeInterval {
             startProbe()
         }
     }
@@ -273,7 +354,7 @@ final class LightEngine: ObservableObject {
         lastProbeAttempt = now
         isProbing = true
         sampler.setSampleInterval(0.07)
-        glow?.showProbe(lit: false, reach: reach)
+        glow?.showProbe(lit: false)
         probeStage = .dark(since: now, samples: [])
     }
 
@@ -289,7 +370,7 @@ final class LightEngine: ObservableObject {
             guard now - since >= Self.probeSettle, reading.faceFound else { return }
             samples.append(reading)
             if samples.count >= Self.probeSamples {
-                glow?.showProbe(lit: true, reach: reach)
+                glow?.showProbe(lit: true)
                 probeStage = .lit(since: now, dark: Self.phase(samples), samples: [])
             } else {
                 probeStage = .dark(since: since, samples: samples)
@@ -319,15 +400,37 @@ final class LightEngine: ObservableObject {
         let context = probeContext
         endProbe()
         lastProbe = ProbeOutcome(date: Date(), result: result)
+        stuckSince = nil
+        if result.failure == .tooBright {
+            isResting = true
+            restFrameLuma = context?.reading.frameLuma ?? 0
+        } else if result.kelvin != nil {
+            isResting = false
+        }
 
         if let measured = result.kelvin, let picture = context?.pictureKelvin {
-            miredCorrection = 1e6 / measured - 1e6 / picture
+            let correction = 1e6 / measured - 1e6 / picture
+            miredCorrection = correction
+            if let context, let features = RoomLearner.features(reading: context.reading, pictureKelvin: picture,
+                                                                level: context.level) {
+                learner.add(features: features, target: correction)
+                learner.save()
+                publishLearner()
+                probeOffset = correction - (learner.predict(features) ?? correction)
+                probeOffsetTime = CACurrentMediaTime()
+            }
             applyRoomKelvin()
         }
         if savesProbes, let context {
             probeLog.append(Self.record(result, context: context, dark: dark, lit: lit))
         }
         pushGlow()
+    }
+
+    private func publishLearner() {
+        learnedProbes = learner.count
+        learnerTrusted = learner.isTrusted
+        learnerError = learner.fit?.error ?? 0
     }
 
     private func cancelProbe() {

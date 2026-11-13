@@ -74,6 +74,8 @@ final class CameraSampler: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     var onReading: ((Reading) -> Void)?
     var onFailure: ((Failure) -> Void)?
+    /// For diagnosis only: the raw frame and the face box Vision found in it.
+    var onFrame: ((CVPixelBuffer, CGRect?) -> Void)?
 
     private let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "sorot.camera")
@@ -155,6 +157,7 @@ final class CameraSampler: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
         let face = faceRequest.results?.max { $0.boundingBox.width < $1.boundingBox.width }
         let mask = personRequest.results?.first?.pixelBuffer
+        onFrame?(frame, face?.boundingBox)
         if let reading = Self.measure(frame: frame, face: face?.boundingBox, personMask: mask) {
             onReading?(reading)
         }

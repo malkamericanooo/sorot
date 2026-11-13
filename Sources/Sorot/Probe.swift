@@ -32,7 +32,7 @@ struct ProbeResult {
             switch self {
             case .faceLost: return "Probe stopped: your face left the view."
             case .noBackground: return "Probe needs some background in view."
-            case .tooBright: return "Too bright here for the screen to register."
+            case .tooBright: return "The pulse barely changed your face. Sit closer or dim the room."
             case .clipped: return "Face overexposed during the pulse. Sit back a little."
             case .implausible: return "Probe gave an implausible reading. Try again."
             }

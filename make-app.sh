@@ -9,6 +9,9 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp "$(swift build -c release --show-bin-path)/Sorot" "$APP/Contents/MacOS/Sorot"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
-# Ad-hoc signature: enough to run on this Mac and to be asked for camera access.
-codesign --force --sign - "$APP"
+# Sign with your Apple Development certificate when you have one, so macOS remembers the
+# camera permission across rebuilds. Without one the signature is ad-hoc: the app still
+# runs, but macOS asks for camera access again after every rebuild.
+IDENTITY="${SOROT_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development/ {print $2; exit}')}"
+codesign --force --sign "${IDENTITY:--}" "$APP"
 echo "Built $APP"

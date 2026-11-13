@@ -53,7 +53,12 @@ func writeStateSnapshots(to folder: URL) {
         ("auto-live", .init()),
         ("auto-probed", .init(roomKelvin: 2900, kelvin: 2900, probe: .init(
             date: Date().addingTimeInterval(-130), result: ProbeResult(kelvin: 2900, screenGain: 0.38)))),
-        ("auto-probe-failed", .init(probe: .init(date: Date(), result: ProbeResult(failure: .tooBright)))),
+        ("auto-learning", .init(roomKelvin: 2900, kelvin: 2900, probe: .init(
+            date: Date().addingTimeInterval(-130), result: ProbeResult(kelvin: 2900, screenGain: 0.38)), learnedProbes: 3)),
+        ("auto-learned", .init(roomKelvin: 3150, kelvin: 3150, learnedProbes: 14, learnerError: 9)),
+        ("auto-probe-failed", .init(probe: .init(date: Date(), result: ProbeResult(failure: .clipped)))),
+        ("auto-resting", .init(faceLuma: 0.26, level: 0, probe: .init(date: Date(), result: ProbeResult(failure: .tooBright)),
+                               isResting: true)),
         ("auto-no-face", .init(faceFound: false, faceLuma: nil, level: 0.4)),
         ("manual", .init(isAutomatic: false, camera: .idle, faceFound: false, faceLuma: nil, roomKelvin: nil, level: 0.6, kelvin: 4500)),
         ("denied", .init(camera: .denied, faceFound: false, faceLuma: nil, roomKelvin: nil, level: 0)),
@@ -125,7 +130,14 @@ func value(after flag: String) -> String? {
 }
 
 if arguments.contains("--selftest") {
-    exit(ProbeMath.selfTest() ? 0 : 1)
+    let probe = ProbeMath.selfTest(), learner = RoomLearner.selfTest()
+    exit(probe && learner ? 0 : 1)
+} else if let path = value(after: "--diagnose") {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    let diagnosis = Diagnosis(output: URL(fileURLWithPath: path))
+    diagnosis.run()
+    app.run()
 } else if let path = value(after: "--snapshot") ?? value(after: "--fonts") {
     _ = NSApplication.shared
     let folder = URL(fileURLWithPath: path)

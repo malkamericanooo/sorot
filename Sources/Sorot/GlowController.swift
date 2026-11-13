@@ -5,8 +5,8 @@ import QuartzCore
 /// in a window that sits above everything and ignores the mouse.
 ///
 /// Clicks pass through the bands, but a solid band still hides what is under it.
-/// So a band fades out while the pointer is inside it and comes back when the
-/// pointer leaves.
+/// So a band dims gradually as the pointer comes near it, is gone by the time the
+/// pointer is inside it, and comes back the same way when the pointer leaves.
 final class GlowController {
     private let window: NSWindow
     private let left = CAGradientLayer()
@@ -16,15 +16,16 @@ final class GlowController {
     private var observer: NSObjectProtocol?
 
     private var pointerTimer: Timer?
-    private var hidden: Set<ObjectIdentifier> = []
     private var lastYield = -Double.infinity
     private var isProbing = false
-    /// The pointer must move this far past a hidden band before the band returns.
-    private static let returnMargin: CGFloat = 28
+    /// Off during diagnosis, so the pointer cannot change what is being measured.
+    var followsPointer = true
+    /// A band starts to dim when the pointer is this far from it, in points.
+    private static let approach: CGFloat = 90
 
-    /// True while a band is out of the pointer's way, and briefly afterwards. The face
+    /// True while a band is dimmed for the pointer, and briefly afterwards. The face
     /// is darker then for a reason the control loop should not try to correct.
-    var isYielding: Bool { !hidden.isEmpty || CACurrentMediaTime() - lastYield < 0.8 }
+    var isYielding: Bool { CACurrentMediaTime() - lastYield < 0.8 }
 
     /// Band width in points at full glow, for the smallest and largest Reach setting.
     private static let reachWidths: ClosedRange<CGFloat> = 60...320
@@ -87,13 +88,14 @@ final class GlowController {
 
     /// The probe's two phases: the bands at full width, solid black and then solid white.
     /// Black first, so the only thing that changes between the phases is the pulse itself.
-    func showProbe(lit: Bool, reach: Double) {
+    /// The pulse ignores Reach: a narrow band is too weak to measure, and it lasts a second.
+    func showProbe(lit: Bool) {
         // The probe needs the whole pulse, so no band stays out of the way during it.
         isProbing = true
         followPointer()
         let v: CGFloat = lit ? 1 : 0
         let colors = Self.band(v, v, v, alpha: 1)
-        draw(width: maxWidth(reach: reach), left: colors, right: colors, top: colors, bottom: colors, animated: false)
+        draw(width: Self.reachWidths.upperBound, left: colors, right: colors, top: colors, bottom: colors, animated: false)
     }
 
     private func maxWidth(reach: Double) -> CGFloat {
@@ -113,7 +115,7 @@ final class GlowController {
             window.orderFrontRegardless()
         }
         if pointerTimer == nil {
-            let timer = Timer(timeInterval: 1.0 / 20, repeats: true) { [weak self] _ in self?.followPointer() }
+            let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in self?.followPointer() }
             RunLoop.main.add(timer, forMode: .common)
             pointerTimer = timer
         }
@@ -139,21 +141,30 @@ final class GlowController {
         let origin = window.frame.origin
         let mouse = NSEvent.mouseLocation
         let point = CGPoint(x: mouse.x - origin.x, y: mouse.y - origin.y)
+        let now = CACurrentMediaTime()
 
         for band in [left, right, top, bottom] {
-            let id = ObjectIdentifier(band)
-            let wasHidden = hidden.contains(id)
-            // A hidden band waits until the pointer is clearly outside, so it does not flicker at its border.
-            let area = wasHidden ? band.frame.insetBy(dx: -Self.returnMargin, dy: -Self.returnMargin) : band.frame
-            let hide = !isProbing && area.contains(point)
-            guard hide != wasHidden else { continue }
+            var wanted: Float = 1
+            if !isProbing, followsPointer {
+                // Distance from the pointer to the band, 0 when inside it.
+                let frame = band.frame
+                let dx = max(frame.minX - point.x, 0, point.x - frame.maxX)
+                let dy = max(frame.minY - point.y, 0, point.y - frame.maxY)
+                let t = min(max(hypot(dx, dy) / Self.approach, 0), 1)
+                wanted = Float(t * t * (3 - 2 * t))
+            }
+            if wanted < 0.97 { lastYield = now }
+            guard abs(band.opacity - wanted) > 0.004 else { continue }
 
-            if hide { hidden.insert(id) } else { hidden.remove(id) }
-            lastYield = CACurrentMediaTime()
             CATransaction.begin()
-            // Leave quickly, return gently.
-            CATransaction.setAnimationDuration(isProbing ? 0 : (hide ? 0.12 : 0.35))
-            band.opacity = hide ? 0 : 1
+            if isProbing {
+                CATransaction.setDisableActions(true)
+            } else {
+                // Long enough that a fast pointer still sees a fade and not a cut.
+                CATransaction.setAnimationDuration(0.3)
+                CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+            }
+            band.opacity = wanted
             CATransaction.commit()
         }
     }
@@ -161,7 +172,6 @@ final class GlowController {
     private func stopFollowingPointer() {
         pointerTimer?.invalidate()
         pointerTimer = nil
-        hidden.removeAll()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for band in [left, right, top, bottom] { band.opacity = 1 }
