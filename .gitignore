@@ -4,3 +4,8 @@ build/
 *.xcodeproj
 .swiftpm/
 fonts-preview/
+
+# Never publish secrets or collected probe data
+.env
+.env.*
+*.jsonl

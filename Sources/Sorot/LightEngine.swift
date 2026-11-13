@@ -223,8 +223,9 @@ final class LightEngine: ObservableObject {
             faceLuma = smoothed
 
             // Integral control: keep nudging the glow until the face sits in the deadband.
+            // While a band is out of the pointer's way the face is darker on purpose, so hold still.
             let error = target - smoothed
-            if abs(error) > Self.deadband {
+            if abs(error) > Self.deadband, glow?.isYielding != true {
                 level = min(max(level + 1.5 * error * dt, 0), 1)
             }
 
