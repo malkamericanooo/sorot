@@ -63,6 +63,18 @@ It trains itself, on your Mac, with no setup:
 
 `Sorot --selftest` checks it on made-up data: it learns a made-up camera's error from 12 probes, and it refuses to trust itself when the data is only noise.
 
+## Install
+
+Needs macOS 13 or later. Works on Apple silicon and Intel Macs.
+
+1. Download `Sorot-0.3.0.zip` from the [latest release](https://github.com/malkamericanooo/sorot/releases/latest) and double-click it.
+2. Drag `Sorot.app` into your Applications folder.
+3. Open it. macOS will refuse the first time, because Sorot is not signed by a paid Apple developer account. Click **Done** (or **OK**).
+4. Open **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to the line about Sorot. Confirm.
+5. Sorot appears in the menu bar. Switch it on and allow camera access.
+
+You only do steps 3 and 4 once. If you would rather not trust a download, build it yourself from the source below; it is the same code.
+
 ## Build
 
 Needs macOS 13 or later and Xcode's command line tools.
@@ -73,6 +85,8 @@ open build/Sorot.app
 ```
 
 The app appears in the menu bar. It starts switched off. The first time you switch it on, macOS asks for camera access.
+
+`./make-release.sh` builds the download: one app for both kinds of Mac, signed ad-hoc and zipped.
 
 `make-app.sh` signs the app with your Apple Development certificate if you have one. Without one the signature is ad-hoc, and macOS asks for camera access again after every rebuild.
 
